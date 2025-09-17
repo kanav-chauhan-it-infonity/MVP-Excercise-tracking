@@ -8,6 +8,8 @@ import { useMediaPipe } from './hooks/useMediaPipe'
 
 // API endpoint configuration
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+// Return URL (e.g., Squarespace homepage)
+const RETURN_URL = process.env.REACT_APP_RETURN_URL || '/';
 
 function Video() {
     const [view, setView] = useState("idle") // idle, cameraReady, recording, recorded, analyzing, feedbackReady, positionCheck
@@ -35,6 +37,7 @@ function Video() {
     const playbackVideoRef = useRef(null)
     const canvasRef = useRef(null)
     const positionCanvasRef = useRef(null)
+    const recordCanvasRef = useRef(null)
     const streamRef = useRef(null)
     const mediaRecorderRef = useRef(null)
     const recordingIntervalRef = useRef(null)
@@ -44,6 +47,8 @@ function Video() {
     const chunksRef = useRef([])
     const poseDetectionRef = useRef(null);
     const lightingCheckTimeoutRef = useRef(null);
+    const recordPoseHistoryRef = useRef([]);
+    const MAX_RECORD_HISTORY = 12;
 
     useEffect(() => {
         return () => {
@@ -128,6 +133,56 @@ function Video() {
                                             radius: 6
                                         });
                                     }
+                                }
+
+                                // Draw to recording canvas (composited frame with tracers)
+                                if (recordCanvasRef.current && liveCameraRef.current && results.poseLandmarks) {
+                                    const rCanvas = recordCanvasRef.current;
+                                    const rCtx = rCanvas.getContext('2d');
+                                    const video = liveCameraRef.current;
+                                    // Size to actual video pixels for best quality
+                                    const w = video.videoWidth || video.clientWidth || 640;
+                                    const h = video.videoHeight || video.clientHeight || 480;
+                                    if (rCanvas.width !== w || rCanvas.height !== h) {
+                                        rCanvas.width = w;
+                                        rCanvas.height = h;
+                                    }
+
+                                    // Draw base video frame
+                                    rCtx.drawImage(video, 0, 0, w, h);
+
+                                    // Maintain short history for trail
+                                    recordPoseHistoryRef.current.push(JSON.parse(JSON.stringify(results.poseLandmarks)));
+                                    if (recordPoseHistoryRef.current.length > MAX_RECORD_HISTORY) {
+                                        recordPoseHistoryRef.current.shift();
+                                    }
+
+                                    // Draw trails
+                                    const connections = POSE_CONNECTIONS;
+                                    recordPoseHistoryRef.current.forEach((landmarks, idx) => {
+                                        const alpha = 0.15 + 0.85 * (idx / recordPoseHistoryRef.current.length);
+                                        const lineWidth = 2 + 2 * (idx / recordPoseHistoryRef.current.length);
+                                        // Lines
+                                        connections.forEach(([s, e]) => {
+                                            const a = landmarks[s];
+                                            const b = landmarks[e];
+                                            if (a && b) {
+                                                rCtx.strokeStyle = `rgba(0, 255, 0, ${alpha * 0.5})`;
+                                                rCtx.lineWidth = lineWidth * 0.8;
+                                                rCtx.beginPath();
+                                                rCtx.moveTo(a.x * w, a.y * h);
+                                                rCtx.lineTo(b.x * w, b.y * h);
+                                                rCtx.stroke();
+                                            }
+                                        });
+                                        // Points
+                                        landmarks.forEach((k) => {
+                                            rCtx.fillStyle = `rgba(255, 0, 0, ${alpha * 0.7})`;
+                                            rCtx.beginPath();
+                                            rCtx.arc(k.x * w, k.y * h, 2 + 4 * (idx / recordPoseHistoryRef.current.length), 0, Math.PI * 2);
+                                            rCtx.fill();
+                                        });
+                                    });
                                 }
                             });
 
@@ -444,7 +499,12 @@ function Video() {
             setAnalysisResult(null)
             chunksRef.current = []
 
-            const mediaRecorder = new MediaRecorder(streamRef.current)
+            // Prefer recording from the composite record canvas so tracers are baked into the video
+            let recordStream = null;
+            if (recordCanvasRef.current && recordCanvasRef.current.captureStream) {
+                recordStream = recordCanvasRef.current.captureStream(30);
+            }
+            const mediaRecorder = new MediaRecorder(recordStream || streamRef.current)
             mediaRecorderRef.current = mediaRecorder
             
             mediaRecorder.ondataavailable = (e) => {
@@ -507,20 +567,29 @@ function Video() {
     // Initialize pose detection with proper settings
     const initPoseDetection = async () => {
         try {
+            // Ensure TFJS is ready and a backend is set
+            if (window.tf && window.tf.ready) {
+                await window.tf.ready();
+                // Prefer webgl if available for speed
+                if (window.tf.getBackend && window.tf.getBackend() !== 'webgl' && window.tf.setBackend) {
+                    try { await window.tf.setBackend('webgl'); } catch (e) { /* no-op */ }
+                }
+            }
+
             // Check if poseDetection is available
             if (!window.poseDetection || !window.poseDetection.SupportedModels) {
                 console.log("Pose detection library not loaded yet");
                 return null;
             }
-            
+
             // Load the pose detection model
             const model = window.poseDetection.SupportedModels.BlazePose;
             const detectorConfig = {
                 runtime: 'tfjs',
                 enableSmoothing: true,
-                modelType: 'full' // Use full model for better accuracy
+                modelType: 'full'
             };
-            
+
             const detector = await window.poseDetection.createDetector(model, detectorConfig);
             setPoseDetection(detector);
             
@@ -699,6 +768,62 @@ function Video() {
         ctx.restore();
     };
 
+    // Lightweight trail renderer for recorded playback
+    const drawPoseTrail = (poseHistory, ctx, videoElement) => {
+        if (!Array.isArray(poseHistory) || poseHistory.length === 0 || !ctx || !videoElement) return;
+
+        const canvas = ctx.canvas;
+        const videoWidth = videoElement.videoWidth || videoElement.clientWidth || 640;
+        const videoHeight = videoElement.videoHeight || videoElement.clientHeight || 480;
+
+        const displayWidth = videoElement.clientWidth;
+        const displayHeight = videoElement.clientHeight;
+        if (canvas.width !== displayWidth || canvas.height !== displayHeight) {
+            canvas.width = displayWidth;
+            canvas.height = displayHeight;
+        }
+
+        const scaleX = displayWidth / videoWidth;
+        const scaleY = displayHeight / videoHeight;
+
+        const connections = POSE_CONNECTIONS;
+        const maxIndex = poseHistory.length - 1;
+
+        // Fade older frames
+        poseHistory.forEach((p, idx) => {
+            if (!p || !p.keypoints) return;
+            const age = (idx + 1) / (maxIndex + 1);
+            const lineAlpha = 0.2 * age; // 0 -> old, 0.2 -> newest in trail
+            const pointAlpha = 0.25 * age;
+
+            // Lines
+            connections.forEach(([startIdx, endIdx]) => {
+                if (startIdx < p.keypoints.length && endIdx < p.keypoints.length) {
+                    const s = p.keypoints[startIdx];
+                    const e = p.keypoints[endIdx];
+                    if (s && e && s.score > 0.1 && e.score > 0.1) {
+                        ctx.strokeStyle = `rgba(34, 197, 94, ${lineAlpha})`; // green-ish
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(s.x * scaleX, s.y * scaleY);
+                        ctx.lineTo(e.x * scaleX, e.y * scaleY);
+                        ctx.stroke();
+                    }
+                }
+            });
+
+            // Points
+            p.keypoints.forEach(k => {
+                if (k && k.score > 0.1) {
+                    ctx.fillStyle = `rgba(239, 68, 68, ${pointAlpha})`; // red-ish
+                    ctx.beginPath();
+                    ctx.arc(k.x * scaleX, k.y * scaleY, 3, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            });
+        });
+    };
+
     // Set video source when recordedBlob changes
     useEffect(() => {
         if (recordedBlob && playbackVideoRef.current) {
@@ -786,13 +911,43 @@ function Video() {
         
         // Keep track of the last frame drawn to avoid redundant drawing
         let lastFrameTime = -1;
+
+        // Keep a short history for tracer effect
+        const poseHistory = [];
+        const MAX_TRAIL = 12; // ~0.4s at 30fps
         
         // Get feedback highlights once for consistent rendering
         const feedbackHighlights = extractFeedbackHighlights(analysisResult.feedback);
         
+        // Local state for client-side inference during playback
+        let inferenceInFlight = false;
+        let latestDetectedPose = null;
+        
         // Handle video time updates to sync pose data with video
-        const handleTimeUpdate = () => {
+        const handleTimeUpdate = async () => {
             if (!sortedPoses.length || view !== "feedbackReady" || !video.duration) {
+                // If we have a detector, still try to draw from client-side inference
+                if (poseDetection && video.readyState >= 2) {
+                    if (!inferenceInFlight) {
+                        inferenceInFlight = true;
+                        try {
+                            const poses = await poseDetection.estimatePoses(video, { flipHorizontal: false });
+                            latestDetectedPose = poses && poses[0] ? {
+                                keypoints: poses[0].keypoints.map(k => ({ x: k.x, y: k.y, score: k.score || 0.5 }))
+                            } : null;
+                        } finally {
+                            inferenceInFlight = false;
+                        }
+                    }
+                    if (latestDetectedPose) {
+                        // Maintain trail history
+                        poseHistory.push(latestDetectedPose);
+                        if (poseHistory.length > MAX_TRAIL) poseHistory.shift();
+                        ctx.clearRect(0, 0, canvas.width, canvas.height);
+                        drawPoseTrail(poseHistory.slice(0, -1), ctx, video);
+                        drawPose(latestDetectedPose, ctx, video, feedbackHighlights);
+                    }
+                }
                 return;
             }
             
@@ -852,9 +1007,36 @@ function Video() {
             }
             
             if (closestPose && closestPose.pose) {
-                // Clear previous drawing and draw the new pose
+                // Update history
+                poseHistory.push(closestPose.pose);
+                if (poseHistory.length > MAX_TRAIL) poseHistory.shift();
+
+                // Clear previous drawing
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                // Draw trail first, then the current pose on top
+                drawPoseTrail(poseHistory.slice(0, -1), ctx, video);
                 drawPose(closestPose.pose, ctx, video, feedbackHighlights);
+            } else if (poseDetection) {
+                // Fallback: run client-side inference if backend poses are not aligned
+                if (!inferenceInFlight) {
+                    inferenceInFlight = true;
+                    try {
+                        const poses = await poseDetection.estimatePoses(video, { flipHorizontal: false });
+                        latestDetectedPose = poses && poses[0] ? {
+                            keypoints: poses[0].keypoints.map(k => ({ x: k.x, y: k.y, score: k.score || 0.5 }))
+                        } : null;
+                    } finally {
+                        inferenceInFlight = false;
+                    }
+                }
+                if (latestDetectedPose) {
+                    poseHistory.push(latestDetectedPose);
+                    if (poseHistory.length > MAX_TRAIL) poseHistory.shift();
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    drawPoseTrail(poseHistory.slice(0, -1), ctx, video);
+                    drawPose(latestDetectedPose, ctx, video, feedbackHighlights);
+                }
             }
         };
         
@@ -883,15 +1065,27 @@ function Video() {
         };
         window.addEventListener('resize', handleResize);
         
+        // Ensure the video element is playable for TFJS frame reads
+        video.crossOrigin = 'anonymous';
+        video.muted = true; // required for autoplay policies
+        video.playsInline = true;
+
         // Add event listeners for accurate synchronization using requestAnimationFrame
         let animationFrameId = null;
         const updateFrame = () => {
-            handleTimeUpdate();
+            // Use promises to allow async handleTimeUpdate without blocking RAF cadence
+            Promise.resolve(handleTimeUpdate());
             animationFrameId = requestAnimationFrame(updateFrame);
         };
         
-        // Start the animation loop
-        animationFrameId = requestAnimationFrame(updateFrame);
+        // Start the animation loop once metadata is ready
+        const startLoop = () => {
+            if (!animationFrameId) {
+                animationFrameId = requestAnimationFrame(updateFrame);
+            }
+        };
+        if (video.readyState >= 2) startLoop();
+        else video.addEventListener('loadedmetadata', startLoop, { once: true });
         
         // Add specific event listeners for seeking
         video.addEventListener('seeking', handleTimeUpdate);
@@ -1728,6 +1922,18 @@ function Video() {
                                         zIndex: 15
                                     }}
                                 />
+                                {/* Hidden composite canvas used for recording with tracers */}
+                                <canvas
+                                    ref={recordCanvasRef}
+                                    style={{
+                                        position: 'absolute',
+                                        left: '-99999px',
+                                        width: '1px',
+                                        height: '1px',
+                                        opacity: 0,
+                                        pointerEvents: 'none'
+                                    }}
+                                />
                             </div>
                         )}
                         {/* Video Playback for Analysis */}
@@ -1768,6 +1974,27 @@ function Video() {
                                 }}
                             />
                         )}
+                {view === 'feedbackReady' && (
+                    <a
+                        href={RETURN_URL}
+                        className="return-link"
+                        style={{
+                            position: 'absolute',
+                            bottom: '12px',
+                            left: '12px',
+                            background: 'rgba(17,24,39,0.7)',
+                            color: 'white',
+                            padding: '8px 12px',
+                            borderRadius: '8px',
+                            textDecoration: 'none',
+                            zIndex: 20
+                        }}
+                        target="_self"
+                        rel="noopener noreferrer"
+                    >
+                        ↩ Return to Site
+                    </a>
+                )}
                         
                         {view === 'idle' && (
                             <div className="video-placeholder">

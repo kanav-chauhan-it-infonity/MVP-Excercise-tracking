@@ -1016,6 +1016,52 @@ def analyze_exercise(video_path, exercise_type, optimization_settings=None):
             results = pose.process(rgb_frame)
             
             if results.pose_landmarks:
+                # Create a copy of the frame for visualization
+                frame_vis = frame.copy()
+                
+                # Draw tracers from previous frames (ghost effect)
+                tracer_history = min(5, len(frame_data))  # Use last 5 frames for tracers
+                for i in range(tracer_history):
+                    if i < len(frame_data):
+                        prev_landmarks = frame_data[-(i+1)]["landmarks"]
+                        alpha = 0.2 + (0.8 * (i / tracer_history))  # Fade out older tracers
+                        
+                        # Draw connections
+                        for connection in mp.solutions.pose.POSE_CONNECTIONS:
+                            start_idx, end_idx = connection
+                            if (0 <= start_idx < len(prev_landmarks) and 
+                                0 <= end_idx < len(prev_landmarks)):
+                                start = prev_landmarks[start_idx]
+                                end = prev_landmarks[end_idx]
+                                if all(k in start and k in end for k in ['x', 'y']):
+                                    pt1 = (int(start['x'] * frame_vis.shape[1]), 
+                                           int(start['y'] * frame_vis.shape[0]))
+                                    pt2 = (int(end['x'] * frame_vis.shape[1]), 
+                                           int(end['y'] * frame_vis.shape[0]))
+                                    cv2.line(frame_vis, pt1, pt2, 
+                                            (0, 255, 0, int(255 * alpha * 0.5)), 
+                                            thickness=2, lineType=cv2.LINE_AA)
+                        
+                        # Draw landmarks
+                        for landmark in prev_landmarks:
+                            if 'x' in landmark and 'y' in landmark:
+                                center = (int(landmark['x'] * frame_vis.shape[1]), 
+                                         int(landmark['y'] * frame_vis.shape[0]))
+                                cv2.circle(frame_vis, center, 3, 
+                                          (0, 0, 255, int(255 * alpha * 0.7)), 
+                                          -1, lineType=cv2.LINE_AA)
+                
+                # Draw current pose (most prominent)
+                mp.solutions.drawing_utils.draw_landmarks(
+                    frame_vis,
+                    results.pose_landmarks,
+                    mp.solutions.pose.POSE_CONNECTIONS,
+                    landmark_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(
+                        color=(0, 255, 0), thickness=2, circle_radius=2),
+                    connection_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(
+                        color=(0, 255, 0), thickness=2)
+                )
+                
                 # Extract relevant landmark data
                 landmarks = results.pose_landmarks.landmark
                 time_sec = frame_index / fps
